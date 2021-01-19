@@ -19,6 +19,8 @@ typedef struct {
     ngx_flag_t  smtp_auth;
     size_t      buffer_size;
     ngx_msec_t  timeout;
+    ngx_msec_t  connect_timeout;
+    ngx_flag_t  proxy_protocol;
 } ngx_mail_proxy_conf_t;
 
 
@@ -36,7 +38,9 @@ static void ngx_mail_proxy_close_session(ngx_mail_session_t *s);
 static void *ngx_mail_proxy_create_conf(ngx_conf_t *cf);
 static char *ngx_mail_proxy_merge_conf(ngx_conf_t *cf, void *parent,
     void *child);
-
+static void ngx_mail_proxy_connect_handler(ngx_event_t *ev);
+static void ngx_mail_proxy_start(ngx_mail_session_t *s);
+static void ngx_mail_proxy_send_proxy_protocol(ngx_mail_session_t *s);
 
 static ngx_command_t  ngx_mail_proxy_commands[] = {
 
@@ -61,6 +65,13 @@ static ngx_command_t  ngx_mail_proxy_commands[] = {
       offsetof(ngx_mail_proxy_conf_t, timeout),
       NULL },
 
+    { ngx_string("connect_timeout"),
+      NGX_MAIL_MAIN_CONF|NGX_MAIL_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_msec_slot,
+      NGX_MAIL_SRV_CONF_OFFSET,
+      offsetof(ngx_mail_proxy_conf_t, connect_timeout),
+      NULL },
+
     { ngx_string("proxy_pass_error_message"),
       NGX_MAIL_MAIN_CONF|NGX_MAIL_SRV_CONF|NGX_CONF_FLAG,
       ngx_conf_set_flag_slot,
@@ -80,6 +91,13 @@ static ngx_command_t  ngx_mail_proxy_commands[] = {
       ngx_conf_set_flag_slot,
       NGX_MAIL_SRV_CONF_OFFSET,
       offsetof(ngx_mail_proxy_conf_t, smtp_auth),
+      NULL },
+
+    { ngx_string("proxy_protocol"),
+      NGX_MAIL_MAIN_CONF|NGX_MAIL_SRV_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_MAIL_SRV_CONF_OFFSET,
+      offsetof(ngx_mail_proxy_conf_t, proxy_protocol),
       NULL },
 
       ngx_null_command
@@ -156,7 +174,6 @@ ngx_mail_proxy_init(ngx_mail_session_t *s, ngx_addr_t *peer)
     p->upstream.connection->pool = s->connection->pool;
 
     s->connection->read->handler = ngx_mail_proxy_block_read;
-    p->upstream.connection->write->handler = ngx_mail_proxy_dummy_handler;
 
     pcf = ngx_mail_get_module_srv_conf(s, ngx_mail_proxy_module);
 
@@ -169,23 +186,139 @@ ngx_mail_proxy_init(ngx_mail_session_t *s, ngx_addr_t *peer)
 
     s->out.len = 0;
 
+    if (rc == NGX_AGAIN) {
+        p->upstream.connection->write->handler = ngx_mail_proxy_connect_handler;
+        p->upstream.connection->read->handler = ngx_mail_proxy_connect_handler;
+
+        ngx_add_timer(p->upstream.connection->write, pcf->connect_timeout);
+
+        ngx_log_debug0(NGX_LOG_DEBUG_MAIL, s->connection->log, 0, "mail proxy delay connect");
+        return;
+    }
+
+    if (pcf->proxy_protocol) {
+        ngx_mail_proxy_send_proxy_protocol(s);
+        return;
+    }
+
+    ngx_mail_proxy_start(s);
+}
+
+
+void
+ngx_mail_proxy_connect_handler(ngx_event_t *ev)
+{
+    ngx_connection_t          *c;
+    ngx_mail_session_t        *s;
+    ngx_mail_proxy_conf_t     *pcf;
+
+    c = ev->data;
+    s = c->data;
+
+    if (ev->timedout) {
+        ngx_log_error(NGX_LOG_ERR, c->log, NGX_ETIMEDOUT, "upstream timed out");
+        ngx_mail_session_internal_server_error(s);
+        return;
+    }
+
+    ngx_del_timer(c->write);
+
+    ngx_log_debug0(NGX_LOG_DEBUG_MAIL, c->log, 0,
+                   "mail proxy connect upstream");
+
+    pcf = ngx_mail_get_module_srv_conf(s, ngx_mail_proxy_module);
+
+    if (pcf->proxy_protocol) {
+        ngx_mail_proxy_send_proxy_protocol(s);
+        return;
+    }
+
+    ngx_mail_proxy_start(s);
+}
+
+
+void
+ngx_mail_proxy_start(ngx_mail_session_t *s)
+{
+    ngx_connection_t             *pc;
+
+    pc = s->proxy->upstream.connection;
+
+    ngx_log_debug0(NGX_LOG_DEBUG_MAIL, s->connection->log, 0,
+                   "mail proxy starting");
+
+    pc->write->handler = ngx_mail_proxy_dummy_handler;
+
     switch (s->protocol) {
 
     case NGX_MAIL_POP3_PROTOCOL:
-        p->upstream.connection->read->handler = ngx_mail_proxy_pop3_handler;
+        pc->read->handler = ngx_mail_proxy_pop3_handler;
         s->mail_state = ngx_pop3_start;
         break;
 
     case NGX_MAIL_IMAP_PROTOCOL:
-        p->upstream.connection->read->handler = ngx_mail_proxy_imap_handler;
+        pc->read->handler = ngx_mail_proxy_imap_handler;
         s->mail_state = ngx_imap_start;
         break;
 
     default: /* NGX_MAIL_SMTP_PROTOCOL */
-        p->upstream.connection->read->handler = ngx_mail_proxy_smtp_handler;
+        pc->read->handler = ngx_mail_proxy_smtp_handler;
         s->mail_state = ngx_smtp_start;
         break;
     }
+
+    if (pc->read->ready) {
+        ngx_post_event(pc->read, &ngx_posted_events);
+    }
+}
+
+
+void
+ngx_mail_proxy_send_proxy_protocol(ngx_mail_session_t *s)
+{
+    u_char                       *p;
+    ssize_t                       n, size;
+    ngx_connection_t             *c, *pc;
+    ngx_peer_connection_t        *u;
+    u_char                        buf[NGX_PROXY_PROTOCOL_MAX_HEADER];
+
+    c = s->connection;
+
+    ngx_log_debug0(NGX_LOG_DEBUG_MAIL, c->log, 0,
+                   "mail proxy send PROXY protocol header");
+
+    p = ngx_proxy_protocol_write(c, buf, buf + NGX_PROXY_PROTOCOL_MAX_HEADER);
+    if (p == NULL) {
+        ngx_mail_proxy_internal_server_error(s);
+        return;
+    }
+
+    u = &s->proxy->upstream;
+
+    pc = u->connection;
+
+    size = p - buf;
+
+    n = pc->send(pc, buf, size);
+
+    if (n != size) {
+
+        /*
+         * PROXY protocol specification:
+         * The sender must always ensure that the header
+         * is sent at once, so that the transport layer
+         * maintains atomicity along the path to the receiver.
+         */
+
+        ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                      "could not send PROXY protocol header at once (%z)", n);
+
+        ngx_mail_proxy_internal_server_error(s);
+
+        return;
+    }
+
+    ngx_mail_proxy_start(s);
 }
 
 
@@ -1184,6 +1317,8 @@ ngx_mail_proxy_create_conf(ngx_conf_t *cf)
     pcf->smtp_auth = NGX_CONF_UNSET;
     pcf->buffer_size = NGX_CONF_UNSET_SIZE;
     pcf->timeout = NGX_CONF_UNSET_MSEC;
+    pcf->connect_timeout = NGX_CONF_UNSET_MSEC;
+    pcf->proxy_protocol = NGX_CONF_UNSET;
 
     return pcf;
 }
@@ -1202,6 +1337,8 @@ ngx_mail_proxy_merge_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_size_value(conf->buffer_size, prev->buffer_size,
                               (size_t) ngx_pagesize);
     ngx_conf_merge_msec_value(conf->timeout, prev->timeout, 24 * 60 * 60000);
+    ngx_conf_merge_msec_value(conf->connect_timeout, prev->connect_timeout, 1000);
+    ngx_conf_merge_value(conf->proxy_protocol, prev->proxy_protocol, 0);
 
     return NGX_CONF_OK;
 }

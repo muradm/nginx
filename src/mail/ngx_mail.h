@@ -37,6 +37,7 @@ typedef struct {
     unsigned                bind:1;
     unsigned                wildcard:1;
     unsigned                ssl:1;
+    unsigned                proxy_protocol:1;
 #if (NGX_HAVE_INET6)
     unsigned                ipv6only:1;
 #endif
@@ -56,6 +57,7 @@ typedef struct {
     ngx_mail_conf_ctx_t    *ctx;
     ngx_str_t               addr_text;
     ngx_uint_t              ssl;    /* unsigned   ssl:1; */
+    unsigned                proxy_protocol:1;
 } ngx_mail_addr_conf_t;
 
 typedef struct {
@@ -125,6 +127,8 @@ typedef struct {
     ngx_mail_conf_ctx_t    *ctx;
 
     ngx_uint_t              listen;  /* unsigned  listen:1; */
+
+    ngx_array_t            *realip_from;     /* array of ngx_cidr_t */
 } ngx_mail_core_srv_conf_t;
 
 
@@ -190,6 +194,7 @@ typedef struct {
     void                  **ctx;
     void                  **main_conf;
     void                  **srv_conf;
+    ngx_mail_addr_conf_t   *addr_conf;
 
     ngx_resolver_ctx_t     *resolver_ctx;
 
@@ -197,6 +202,7 @@ typedef struct {
 
     ngx_uint_t              mail_state;
 
+    unsigned                proxy_protocol:1;
     unsigned                protocol:3;
     unsigned                blocked:1;
     unsigned                quit:1;

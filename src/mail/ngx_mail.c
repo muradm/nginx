@@ -402,6 +402,7 @@ ngx_mail_add_addrs(ngx_conf_t *cf, ngx_mail_port_t *mport,
         addrs[i].addr = sin->sin_addr.s_addr;
 
         addrs[i].conf.ctx = addr[i].opt.ctx;
+        addrs[i].conf.proxy_protocol = addr[i].opt.proxy_protocol;
 #if (NGX_MAIL_SSL)
         addrs[i].conf.ssl = addr[i].opt.ssl;
 #endif
@@ -436,6 +437,7 @@ ngx_mail_add_addrs6(ngx_conf_t *cf, ngx_mail_port_t *mport,
         addrs6[i].addr6 = sin6->sin6_addr;
 
         addrs6[i].conf.ctx = addr[i].opt.ctx;
+        addrs6[i].conf.proxy_protocol = addr[i].opt.proxy_protocol;
 #if (NGX_MAIL_SSL)
         addrs6[i].conf.ssl = addr[i].opt.ssl;
 #endif
